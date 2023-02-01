@@ -120,6 +120,9 @@ void optimizeTreeSecondPass(const QueryPlanOptimizationSettings & optimization_s
         {
             has_reading_from_mt |= typeid_cast<const ReadFromMergeTree *>(frame.node->step.get()) != nullptr;
 
+            /// insert sorting for join if needed before optimizeReadInOrder to optimize them
+            applyOrderForJoin(*frame.node, nodes, optimization_settings);
+
             if (optimization_settings.read_in_order)
                 optimizeReadInOrder(*frame.node, nodes);
 

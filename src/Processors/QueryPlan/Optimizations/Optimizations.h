@@ -111,6 +111,9 @@ void optimizeAggregationInOrder(QueryPlan::Node & node, QueryPlan::Nodes &);
 bool optimizeUseAggregateProjections(QueryPlan::Node & node, QueryPlan::Nodes & nodes);
 bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes);
 
+/// Insert sorting step before join if needed or use read in order
+void applyOrderForJoin(QueryPlan::Node & node, QueryPlan::Nodes & nodes, const QueryPlanOptimizationSettings & optimization_settings);
+
 /// Enable memory bound merging of aggregation states for remote queries
 /// in case it was enabled for local plan
 void enableMemoryBoundMerging(QueryPlan::Node & node, QueryPlan::Nodes &);
