@@ -28,25 +28,20 @@ Header: key String
   Header: s1.key_0 String
           s2.key_2 String
           s2.value_1 String
-    Sorting
+    Expression
     Header: s1.key_0 String
-      Expression
-      Header: s1.key_0 String
-        ReadFromStorage
-        Header: dummy UInt8
-    Sorting
+      ReadFromStorage
+      Header: dummy UInt8
+    Union
     Header: s2.key_2 String
             s2.value_1 String
-      Union
+      Expression
       Header: s2.key_2 String
               s2.value_1 String
-        Expression
-        Header: s2.key_2 String
-                s2.value_1 String
-          ReadFromStorage
-          Header: dummy UInt8
-        Expression
-        Header: s2.key_2 String
-                s2.value_1 String
-          ReadFromStorage
-          Header: dummy UInt8
+        ReadFromStorage
+        Header: dummy UInt8
+      Expression
+      Header: s2.key_2 String
+              s2.value_1 String
+        ReadFromStorage
+        Header: dummy UInt8
