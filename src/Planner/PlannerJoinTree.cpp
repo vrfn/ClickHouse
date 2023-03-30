@@ -1138,7 +1138,9 @@ JoinTreeQueryPlan buildQueryPlanForJoinNode(const QueryTreeNodePtr & join_table_
     }
 
     const Block & right_header = right_plan.getCurrentDataStream().header;
-    auto join_algorithm = chooseJoinAlgorithm(table_join, join_node.getRightTableExpression(), left_header, right_header, planner_context);
+
+    auto join_algorithm = chooseJoinAlgorithm(table_join, join_node.getRightTableExpression(), left_header, right_header,
+        join_clauses_and_actions.mixed_join_expressions_actions, planner_context);
 
     auto result_plan = QueryPlan();
 
