@@ -98,8 +98,9 @@ public:
 
                 if (isNameOfInFunction(function_node.getFunctionName()))
                 {
+                    const auto & in_first_argument_node = function_node.getArguments().getNodes().at(0);
                     const auto & in_second_argument_node = function_node.getArguments().getNodes().at(1);
-                    in_function_second_argument_node_name = planner_context.createSetKey(in_second_argument_node);
+                    in_function_second_argument_node_name = planner_context.createSetKey(in_first_argument_node->getResultType(), in_second_argument_node);
                 }
 
                 WriteBufferFromOwnString buffer;
@@ -623,9 +624,10 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
 PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::makeSetForInFunction(const QueryTreeNodePtr & node)
 {
     const auto & function_node = node->as<FunctionNode &>();
+    auto in_first_argument = function_node.getArguments().getNodes().at(0);
     auto in_second_argument = function_node.getArguments().getNodes().at(1);
 
-    auto set_key = planner_context->createSetKey(in_second_argument);
+    auto set_key = planner_context->createSetKey(in_first_argument->getResultType(), in_second_argument);
     const auto & planner_set = planner_context->getSetOrThrow(set_key);
 
     ColumnWithTypeAndName column;

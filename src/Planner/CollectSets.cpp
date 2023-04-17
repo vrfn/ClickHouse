@@ -42,7 +42,7 @@ public:
 
         const auto & settings = planner_context.getQueryContext()->getSettingsRef();
 
-        String set_key = planner_context.createSetKey(in_second_argument);
+        String set_key = planner_context.createSetKey(in_first_argument->getResultType(), in_second_argument);
 
         if (planner_context.hasSet(set_key))
             return;
