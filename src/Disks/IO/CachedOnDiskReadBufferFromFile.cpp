@@ -644,8 +644,8 @@ void CachedOnDiskReadBufferFromFile::predownload(FileSegmentPtr & file_segment)
 
                 bytes_to_predownload = 0;
 
-                chassert(file_segment->state() == FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION);
-                /// LOG_TEST(log, "Bypassing cache because for {}", file_segment->getInfoForLog());
+                chassert(file_segment->state() == FileSegment::State::PARTIALLY_DOWNLOADED_NO_CONTINUATION
+                         || file_segment->state() == FileSegment::State::SKIP_CACHE);
 
                 read_type = ReadType::REMOTE_FS_READ_BYPASS_CACHE;
 
