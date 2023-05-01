@@ -8,8 +8,16 @@
 #include "CHColumnToArrowColumn.h"
 
 
+namespace CurrentMetrics
+{
+    extern const Metric ParquetEncoderThreads;
+    extern const Metric ParquetEncoderThreadsActive;
+}
+
 namespace DB
 {
+
+using namespace Parquet;
 
 namespace ErrorCodes
 {
@@ -67,70 +75,198 @@ parquet::Compression::type getParquetCompression(FormatSettings::ParquetCompress
 ParquetBlockOutputFormat::ParquetBlockOutputFormat(WriteBuffer & out_, const Block & header_, const FormatSettings & format_settings_)
     : IOutputFormat(header_, out_), format_settings{format_settings_}
 {
+    if (format_settings.parquet.use_custom_encoder)
+    {
+        if (format_settings.parquet.parallel_encoding && format_settings.max_threads > 1)
+            pool = std::make_unique<ThreadPool>(
+                CurrentMetrics::ParquetEncoderThreads, CurrentMetrics::ParquetEncoderThreadsActive,
+                format_settings.max_threads);
+
+        using C = FormatSettings::ParquetCompression;
+        switch (format_settings.parquet.output_compression_method)
+        {
+            case C::NONE: options.compression = CompressionMethod::None; break;
+            case C::SNAPPY: options.compression = CompressionMethod::Snappy; break;
+            case C::ZSTD: options.compression = CompressionMethod::Zstd; break;
+            case C::LZ4: options.compression = CompressionMethod::Lz4; break;
+            case C::GZIP: options.compression = CompressionMethod::Gzip; break;
+            case C::BROTLI: options.compression = CompressionMethod::Brotli; break;
+        }
+        options.output_string_as_string = format_settings.parquet.output_string_as_string;
+        options.output_fixed_string_as_fixed_byte_array = format_settings.parquet.output_fixed_string_as_fixed_byte_array;
+
+        schema = convertSchema(header_, options);
+    }
+}
+
+ParquetBlockOutputFormat::~ParquetBlockOutputFormat()
+{
+    if (pool)
+    {
+        is_stopped = true;
+        pool->wait();
+    }
 }
 
 void ParquetBlockOutputFormat::consume(Chunk chunk)
 {
+    /// Poll background tasks.
+    if (pool) {
+        std::unique_lock lock(mutex);
+        while (true)
+        {
+            /// If some row groups are ready to be written to the file, write them.
+            reapCompletedRowGroups(lock);
+
+            if (background_exception)
+                std::rethrow_exception(background_exception);
+
+            if (is_stopped)
+                return;
+
+            /// If there's too much work in flight, wait for some of it to complete.
+            if (row_groups.size() < 2)
+                break;
+            if (bytes_in_flight <= format_settings.parquet.row_group_bytes * 4 &&
+                task_queue.size() <= format_settings.max_threads * 4)
+                break;
+
+            condvar.wait(lock);
+        }
+    }
+
     /// Do something like SquashingTransform to produce big enough row groups.
     /// Because the real SquashingTransform is only used for INSERT, not for SELECT ... INTO OUTFILE.
     /// The latter doesn't even have a pipeline where a transform could be inserted, so it's more
-    /// convenient to do the squashing here.
+    /// convenient to do the squashing here. It's also parallelized here.
 
-    appendToAccumulatedChunk(std::move(chunk));
-
-    if (!accumulated_chunk)
-        return;
+    if (chunk.getNumRows() != 0)
+    {
+        accumulated_rows += chunk.getNumRows();
+        accumulated_bytes += chunk.bytes();
+        accumulated_chunks.push_back(std::move(chunk));
+    }
 
     const size_t target_rows = std::max(static_cast<size_t>(1), format_settings.parquet.row_group_rows);
 
-    if (accumulated_chunk.getNumRows() < target_rows &&
-        accumulated_chunk.bytes() < format_settings.parquet.row_group_bytes)
+    if (accumulated_rows < target_rows &&
+        accumulated_bytes < format_settings.parquet.row_group_bytes)
         return;
 
     /// Increase row group size slightly (by < 2x) to avoid adding a small row groups for the
     /// remainder of the new chunk.
     /// E.g. suppose input chunks are 70K rows each, and max_rows = 1M. Then we'll have
     /// getNumRows() = 1.05M. We want to write all 1.05M as one row group instead of 1M and 0.05M.
-    size_t num_row_groups = std::max(static_cast<UInt64>(1), accumulated_chunk.getNumRows() / target_rows);
-    size_t row_group_size = (accumulated_chunk.getNumRows() - 1) / num_row_groups + 1; // round up
+    size_t num_row_groups = std::max(static_cast<UInt64>(1), accumulated_rows / target_rows);
+    size_t row_group_size = (accumulated_rows - 1) / num_row_groups + 1; // round up
 
-    write(std::move(accumulated_chunk), row_group_size);
-    accumulated_chunk.clear();
+    write(std::move(accumulated_chunks), row_group_size);
+    accumulated_chunks.clear();
+    accumulated_rows = 0;
+    accumulated_bytes = 0;
 }
 
 void ParquetBlockOutputFormat::finalizeImpl()
 {
-    if (accumulated_chunk)
-        write(std::move(accumulated_chunk), format_settings.parquet.row_group_rows);
+    if (!accumulated_chunks.empty())
+        write(std::move(accumulated_chunks), format_settings.parquet.row_group_rows);
 
-    if (!file_writer)
+    if (format_settings.parquet.use_custom_encoder)
     {
-        const Block & header = getPort(PortKind::Main).getHeader();
-        write(Chunk(header.getColumns(), 0), 1);
-    }
+        if (pool) {
+            std::unique_lock lock(mutex);
 
-    auto status = file_writer->Close();
-    if (!status.ok())
-        throw Exception(ErrorCodes::UNKNOWN_EXCEPTION, "Error while closing a table: {}", status.ToString());
+            /// Wait for background work to complete.
+            while (true)
+            {
+                reapCompletedRowGroups(lock);
+
+                if (background_exception)
+                    std::rethrow_exception(background_exception);
+
+                if (is_stopped)
+                    return;
+
+                if (row_groups.empty())
+                    break;
+
+                condvar.wait(lock);
+            }
+        }
+
+        if (row_groups_complete.empty())
+            writeFileHeader(out);
+        writeFileFooter(std::move(row_groups_complete), schema, out);
+    }
+    else
+    {
+        if (!file_writer)
+        {
+            const Block & header = getPort(PortKind::Main).getHeader();
+            std::vector<Chunk> chunks;
+            chunks.push_back(Chunk(header.getColumns(), 0));
+            write(std::move(chunks), 1);
+        }
+
+        if (file_writer)
+        {
+            auto status = file_writer->Close();
+            if (!status.ok())
+                throw Exception(ErrorCodes::UNKNOWN_EXCEPTION, "Error while closing a table: {}", status.ToString());
+        }
+    }
 }
 
 void ParquetBlockOutputFormat::resetFormatterImpl()
 {
+    if (pool)
+    {
+        is_stopped = true;
+        pool->wait();
+        is_stopped = false;
+    }
+
+    background_exception = nullptr;
+    threads_running = 0;
+    task_queue.clear();
+    row_groups.clear();
     file_writer.reset();
+    row_groups_complete.clear();
+    accumulated_chunks.clear();
+    accumulated_rows = 0;
+    accumulated_bytes = 0;
 }
 
-void ParquetBlockOutputFormat::appendToAccumulatedChunk(Chunk chunk)
+void ParquetBlockOutputFormat::onCancel()
 {
-    if (!accumulated_chunk)
+    is_stopped = true;
+}
+
+void ParquetBlockOutputFormat::write(std::vector<Chunk> chunks, size_t row_group_size)
+{
+    /// TODO: If the chunk is longer than the target row group size, split it into multiple
+    ///       chunks first. Arrow does this splitting automatically, but our encoder doesn't
+    ///       (it would be inconvenient). In practice this will be rare because read chunks are
+    ///       usually much smaller than target row group size.
+
+    if (pool)
     {
-        accumulated_chunk = std::move(chunk);
+        writeRowGroupInParallel(std::move(chunks));
         return;
     }
-    chassert(accumulated_chunk.getNumColumns() == chunk.getNumColumns());
-    accumulated_chunk.append(chunk);
+
+    Chunk concatenated = std::move(chunks[0]);
+    for (size_t i = 1; i < chunks.size(); ++i)
+        concatenated.append(chunks[i]);
+    chunks.clear();
+
+    if (format_settings.parquet.use_custom_encoder)
+        writeRowGroupInOneThread(std::move(concatenated));
+    else
+        writeUsingArrow(std::move(concatenated), row_group_size);
 }
 
-void ParquetBlockOutputFormat::write(Chunk chunk, size_t row_group_size)
+void ParquetBlockOutputFormat::writeUsingArrow(Chunk chunk, size_t row_group_size)
 {
     const size_t columns_num = chunk.getNumColumns();
     std::shared_ptr<arrow::Table> arrow_table;
@@ -170,6 +306,224 @@ void ParquetBlockOutputFormat::write(Chunk chunk, size_t row_group_size)
 
     if (!status.ok())
         throw Exception(ErrorCodes::UNKNOWN_EXCEPTION, "Error while writing a table: {}", status.ToString());
+}
+
+void ParquetBlockOutputFormat::writeRowGroupInOneThread(Chunk chunk)
+{
+    if (chunk.getNumRows() == 0)
+        return;
+
+    const Block & header = getPort(PortKind::Main).getHeader();
+    Parquet::ColumnChunkWriteStates columns_to_write;
+    chassert(header.columns() == chunk.getNumColumns());
+    for (size_t i = 0; i < header.columns(); ++i)
+        prepareColumnForWrite(
+            chunk.getColumns()[i], header.getByPosition(i).type, header.getByPosition(i).name,
+            options, &columns_to_write);
+
+    if (row_groups_complete.empty())
+        writeFileHeader(out);
+
+    std::vector<parquet::format::ColumnChunk> column_chunks;
+    for (auto & s : columns_to_write)
+    {
+        size_t offset = out.count();
+        writeColumnChunkBody(s, options, out);
+        auto c = finalizeColumnChunkAndWriteFooter(offset, std::move(s), options, out);
+        column_chunks.push_back(std::move(c));
+    }
+
+    auto r = makeRowGroup(std::move(column_chunks), chunk.getNumRows());
+    row_groups_complete.push_back(std::move(r));
+}
+
+void ParquetBlockOutputFormat::writeRowGroupInParallel(std::vector<Chunk> chunks)
+{
+    std::unique_lock lock(mutex);
+
+    const Block & header = getPort(PortKind::Main).getHeader();
+
+    RowGroupState & r = row_groups.emplace_back();
+    r.column_chunks.resize(header.columns());
+    r.tasks_in_flight = r.column_chunks.size();
+
+    std::vector<Columns> columnses;
+    for (auto & chunk : chunks)
+    {
+        chassert(header.columns() == chunk.getNumColumns());
+        r.num_rows += chunk.getNumRows();
+        columnses.push_back(chunk.detachColumns());
+    }
+
+    for (size_t i = 0; i < header.columns(); ++i)
+    {
+        Task & t = task_queue.emplace_back(&r, i, this);
+        t.column_type = header.getByPosition(i).type;
+        t.column_name = header.getByPosition(i).name;
+
+        /// Defer concatenating the columns to the threads.
+        size_t bytes = 0;
+        for (size_t j = 0; j < chunks.size(); ++j)
+        {
+            auto & col = columnses[j][i];
+            bytes += col->allocatedBytes();
+            t.column_pieces.push_back(std::move(col));
+        }
+        t.mem.set(bytes);
+    }
+
+    startMoreThreadsIfNeeded(lock);
+}
+
+void ParquetBlockOutputFormat::reapCompletedRowGroups(std::unique_lock<std::mutex> & lock)
+{
+    while (!row_groups.empty() && row_groups.front().tasks_in_flight == 0 && !is_stopped)
+    {
+        RowGroupState & r = row_groups.front();
+
+        /// Write to the file.
+
+        lock.unlock();
+
+        if (row_groups_complete.empty())
+            writeFileHeader(out);
+
+        std::vector<parquet::format::ColumnChunk> metadata;
+        for (auto & cols : r.column_chunks)
+        {
+            for (ColumnChunk & col : cols)
+            {
+                size_t offset = out.count();
+
+                out.write(col.serialized.data(), col.serialized.size());
+                auto m = finalizeColumnChunkAndWriteFooter(offset, std::move(col.state), options, out);
+
+                metadata.push_back(std::move(m));
+            }
+        }
+
+        row_groups_complete.push_back(makeRowGroup(std::move(metadata), r.num_rows));
+
+        lock.lock();
+
+        row_groups.pop_front();
+    }
+}
+
+void ParquetBlockOutputFormat::startMoreThreadsIfNeeded(const std::unique_lock<std::mutex> &)
+{
+    /// Speculate that all current are already working on tasks.
+    size_t to_add = std::min(task_queue.size(), format_settings.max_threads - threads_running);
+    for (size_t i = 0; i < to_add; ++i)
+    {
+        auto job = [this, thread_group = CurrentThread::getGroup()]()
+        {
+            if (thread_group)
+                CurrentThread::attachToGroupIfDetached(thread_group);
+            SCOPE_EXIT_SAFE(if (thread_group) CurrentThread::detachFromGroupIfNotDetached(););
+
+            try
+            {
+                setThreadName("ParquetEncoder");
+
+                threadFunction();
+            }
+            catch (...)
+            {
+                std::lock_guard lock(mutex);
+                background_exception = std::current_exception();
+                condvar.notify_all();
+                --threads_running;
+            }
+        };
+
+        if (threads_running == 0)
+        {
+            /// First thread. We need it to succeed; otherwise we may get stuck.
+            pool->scheduleOrThrowOnError(job);
+            ++threads_running;
+        }
+        else
+        {
+            /// More threads. This may be called from inside the thread pool, so avoid waiting;
+            /// otherwise it may deadlock.
+            if (!pool->trySchedule(job))
+                break;
+        }
+    }
+}
+
+void ParquetBlockOutputFormat::threadFunction()
+{
+    std::unique_lock lock(mutex);
+
+    while (true)
+    {
+        if (task_queue.empty() || is_stopped)
+        {
+            /// The check and the decrement need to be in the same critical section, to make sure
+            /// we never get stuck with tasks but no threads.
+            --threads_running;
+            return;
+        }
+
+        auto task = std::move(task_queue.front());
+        task_queue.pop_front();
+
+        if (task.column_type)
+        {
+            lock.unlock();
+
+            IColumn::MutablePtr concatenated = IColumn::mutate(std::move(task.column_pieces[0]));
+            for (size_t i = 1; i < task.column_pieces.size(); ++i)
+            {
+                auto & c = task.column_pieces[i];
+                concatenated->insertRangeFrom(*c, 0, c->size());
+                c.reset();
+            }
+            task.column_pieces.clear();
+
+            std::vector<ColumnChunkWriteState> subcolumns;
+            prepareColumnForWrite(
+                std::move(concatenated), task.column_type, task.column_name, options, &subcolumns);
+
+            lock.lock();
+
+            for (size_t i = 0; i < subcolumns.size(); ++i)
+            {
+                task.row_group->column_chunks[task.column_idx].emplace_back(this);
+                task.row_group->tasks_in_flight += 1;
+
+                auto & t = task_queue.emplace_back(task.row_group, task.column_idx, this);
+                t.subcolumn_idx = i;
+                t.state = std::move(subcolumns[i]);
+                t.mem.set(t.state.allocatedBytes());
+            }
+
+            startMoreThreadsIfNeeded(lock);
+        }
+        else
+        {
+            lock.unlock();
+
+            PODArray<char> serialized;
+            {
+                WriteBufferFromVector buf(serialized);
+                writeColumnChunkBody(task.state, options, buf);
+            }
+
+            lock.lock();
+
+            auto & c = task.row_group->column_chunks[task.column_idx][task.subcolumn_idx];
+            c.state = std::move(task.state);
+            c.serialized = std::move(serialized);
+            c.mem.set(c.serialized.size() + c.state.allocatedBytes());
+        }
+
+        --task.row_group->tasks_in_flight;
+
+        condvar.notify_all();
+    }
 }
 
 void registerOutputFormatParquet(FormatFactory & factory)

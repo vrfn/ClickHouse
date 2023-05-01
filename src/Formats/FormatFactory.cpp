@@ -122,6 +122,7 @@ FormatSettings getFormatSettings(ContextPtr context, const Settings & settings)
     format_settings.parquet.output_fixed_string_as_fixed_byte_array = settings.output_format_parquet_fixed_string_as_fixed_byte_array;
     format_settings.parquet.max_block_size = settings.input_format_parquet_max_block_size;
     format_settings.parquet.output_compression_method = settings.output_format_parquet_compression_method;
+    format_settings.parquet.use_custom_encoder = settings.output_format_parquet_use_custom_encoder;
     format_settings.pretty.charset = settings.output_format_pretty_grid_charset.toString() == "ASCII" ? FormatSettings::Pretty::Charset::ASCII : FormatSettings::Pretty::Charset::UTF8;
     format_settings.pretty.color = settings.output_format_pretty_color;
     format_settings.pretty.max_column_pad_width = settings.output_format_pretty_max_column_pad_width;
@@ -482,7 +483,7 @@ OutputFormatPtr FormatFactory::getOutputFormatParallelIfPossible(
         return format;
     }
 
-    return getOutputFormat(name, buf, sample, context, _format_settings);
+    return getOutputFormat(name, buf, sample, context, format_settings);
 }
 
 
@@ -501,6 +502,7 @@ OutputFormatPtr FormatFactory::getOutputFormat(
         context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Format, name);
 
     auto format_settings = _format_settings ? *_format_settings : getFormatSettings(context);
+    format_settings.max_threads = context->getSettingsRef().max_threads;
 
     /** TODO: Materialization is needed, because formats can use the functions `IDataType`,
       *  which only work with full columns.
