@@ -1,3 +1,4 @@
+#include "Interpreters/threadPoolCallbackRunner.h"
 #include "Storages/MergeTree/MergeTreeDataPartBuilder.h"
 #include <Storages/MergeTree/MergeTreeData.h>
 
@@ -1622,8 +1623,11 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
         }
     }
 
-    ThreadPool pool(CurrentMetrics::MergeTreePartsLoaderThreads, CurrentMetrics::MergeTreePartsLoaderThreadsActive, disks.size());
+    auto runner = threadPoolCallbackRunner<void>(OutdatedPartsLoadingThreadPool::get(), "ActiveParts");
     std::vector<PartLoadingTree::PartLoadingInfos> parts_to_load_by_disk(disks.size());
+
+    std::vector<std::future<void>> disks_futures;
+    disks_futures.reserve(disks.size());
 
     for (size_t i = 0; i < disks.size(); ++i)
     {
@@ -1633,7 +1637,7 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
 
         auto & disk_parts = parts_to_load_by_disk[i];
 
-        pool.scheduleOrThrowOnError([&, disk_ptr]()
+        disks_futures.push_back(runner([&, disk_ptr]()
         {
             for (auto it = disk_ptr->iterateDirectory(relative_data_path); it->isValid(); it->next())
             {
@@ -1646,10 +1650,13 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
                 if (auto part_info = MergeTreePartInfo::tryParsePartName(it->name(), format_version))
                     disk_parts.emplace_back(*part_info, it->name(), disk_ptr);
             }
-        });
+        }, 0));
     }
 
-    pool.wait();
+    /// For for iteration to be completed
+    for (auto & future : disks_futures)
+        future.wait();
+    disks_futures.clear();
 
     PartLoadingTree::PartLoadingInfos parts_to_load;
     for (auto & disk_parts : parts_to_load_by_disk)
@@ -1715,9 +1722,11 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
 
     if (settings->in_memory_parts_enable_wal)
     {
-        pool.setMaxThreads(disks.size());
         std::vector<MutableDataPartsVector> disks_wal_parts(disks.size());
         std::mutex wal_init_lock;
+
+        std::vector<std::future<void>> wal_disks_futures;
+        wal_disks_futures.reserve(disks.size());
 
         for (size_t i = 0; i < disks.size(); ++i)
         {
@@ -1727,7 +1736,7 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
 
             auto & disk_wal_parts = disks_wal_parts[i];
 
-            pool.scheduleOrThrowOnError([&, disk_ptr]()
+            wal_disks_futures.push_back(runner([&, disk_ptr]()
             {
                 for (auto it = disk_ptr->iterateDirectory(relative_data_path); it->isValid(); it->next())
                 {
@@ -1753,10 +1762,13 @@ void MergeTreeData::loadDataParts(bool skip_sanity_checks)
                             disk_wal_parts.push_back(std::move(part));
                     }
                 }
-            });
+            }, 0));
         }
 
-        pool.wait();
+        /// For for iteration to be completed
+        for (auto & future : wal_disks_futures)
+            future.wait();
+        wal_disks_futures.clear();
 
         MutableDataPartsVector parts_from_wal;
         for (auto & disk_wal_parts : disks_wal_parts)
