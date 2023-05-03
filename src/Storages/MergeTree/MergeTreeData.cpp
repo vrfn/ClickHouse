@@ -1,4 +1,3 @@
-#include "Interpreters/threadPoolCallbackRunner.h"
 #include "Storages/MergeTree/MergeTreeDataPartBuilder.h"
 #include <Storages/MergeTree/MergeTreeData.h>
 
@@ -129,10 +128,6 @@ namespace ProfileEvents
 namespace CurrentMetrics
 {
     extern const Metric DelayedInserts;
-    extern const Metric MergeTreePartsLoaderThreads;
-    extern const Metric MergeTreePartsLoaderThreadsActive;
-    extern const Metric MergeTreePartsCleanerThreads;
-    extern const Metric MergeTreePartsCleanerThreadsActive;
 }
 
 
@@ -2390,9 +2385,8 @@ void MergeTreeData::clearPartsFromFilesystemImpl(const DataPartsVector & parts_t
     }
 
     /// Parallel parts removal.
-    size_t num_threads = std::min<size_t>(settings->max_part_removal_threads, parts_to_remove.size());
     std::mutex part_names_mutex;
-    ThreadPool pool(CurrentMetrics::MergeTreePartsCleanerThreads, CurrentMetrics::MergeTreePartsCleanerThreadsActive, num_threads);
+    auto runner = threadPoolCallbackRunner<void>(PartsCleaningThreadPool::get(), "PartsCleaning");
 
     bool has_zero_copy_parts = false;
     if (settings->allow_remote_fs_zero_copy_replication && dynamic_cast<StorageReplicatedMergeTree *>(this) != nullptr)
@@ -2410,27 +2404,26 @@ void MergeTreeData::clearPartsFromFilesystemImpl(const DataPartsVector & parts_t
         LOG_DEBUG(
             log, "Removing {} parts from filesystem (concurrently): Parts: [{}]", parts_to_remove.size(), fmt::join(parts_to_remove, ", "));
 
+        std::vector<std::future<void>> parts_to_remove_futures;
+        parts_to_remove_futures.reserve(parts_to_remove.size());
+
         for (const DataPartPtr & part : parts_to_remove)
         {
-            pool.scheduleOrThrowOnError([&part, &part_names_mutex, part_names_succeed, thread_group = CurrentThread::getGroup()]
+            parts_to_remove_futures.push_back(runner([&part, &part_names_mutex, part_names_succeed, thread_group = CurrentThread::getGroup()]
             {
-                SCOPE_EXIT_SAFE(
-                    if (thread_group)
-                        CurrentThread::detachFromGroupIfNotDetached();
-                );
-                if (thread_group)
-                    CurrentThread::attachToGroupIfDetached(thread_group);
-
                 asMutableDeletingPart(part)->remove();
                 if (part_names_succeed)
                 {
                     std::lock_guard lock(part_names_mutex);
                     part_names_succeed->insert(part->name);
                 }
-            });
+            }, 0));
         }
 
-        pool.wait();
+        for (auto & future : parts_to_remove_futures)
+            future.wait();
+        parts_to_remove_futures.clear();
+
         return;
     }
 
@@ -2461,6 +2454,10 @@ void MergeTreeData::clearPartsFromFilesystemImpl(const DataPartsVector & parts_t
 
     auto independent_ranges_infos = independent_ranges_set.getPartInfos();
     size_t sum_of_ranges = 0;
+
+    std::vector<std::future<void>> independent_ranges_infos_futures;
+    independent_ranges_infos_futures.reserve(independent_ranges_infos.size());
+
     for (auto range : independent_ranges_infos)
     {
         range.level = MergeTreePartInfo::MAX_LEVEL;
@@ -2472,16 +2469,9 @@ void MergeTreeData::clearPartsFromFilesystemImpl(const DataPartsVector & parts_t
                 parts_in_range.push_back(part);
         sum_of_ranges += parts_in_range.size();
 
-        pool.scheduleOrThrowOnError(
+        independent_ranges_infos_futures.push_back(runner(
             [this, range, &part_names_mutex, part_names_succeed, thread_group = CurrentThread::getGroup(), batch = std::move(parts_in_range)]
         {
-            SCOPE_EXIT_SAFE(
-                if (thread_group)
-                    CurrentThread::detachFromGroupIfNotDetached();
-            );
-            if (thread_group)
-                CurrentThread::attachToGroupIfDetached(thread_group);
-
             LOG_TRACE(log, "Removing {} parts in blocks range {}", batch.size(), range.getPartNameForLogs());
 
             for (const auto & part : batch)
@@ -2493,10 +2483,12 @@ void MergeTreeData::clearPartsFromFilesystemImpl(const DataPartsVector & parts_t
                     part_names_succeed->insert(part->name);
                 }
             }
-        });
+        }, 0));
     }
 
-    pool.wait();
+    for (auto & future : independent_ranges_infos_futures)
+            future.wait();
+        independent_ranges_infos_futures.clear();
 
     if (parts_to_remove.size() != sum_of_ranges)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Number of removed parts is not equal to number of parts in independent ranges "
