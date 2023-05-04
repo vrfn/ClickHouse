@@ -115,11 +115,10 @@ static Block createBlockFromCollection(const Collection & collection, const Data
     {
         if (columns_num == 1)
         {
-            Field field;
-            bool is_conversion_ok = convertFieldToTypeStrict(value, *types[0], field);
+            auto field = convertFieldToTypeStrict(value, *types[0]);
             bool need_insert_null = transform_null_in && types[0]->isNullable();
-            if (is_conversion_ok && (!field.isNull() || need_insert_null))
-                columns[0]->insert(field);
+            if (field && (!field->isNull() || need_insert_null))
+                columns[0]->insert(*field);
         }
         else
         {
@@ -140,9 +139,10 @@ static Block createBlockFromCollection(const Collection & collection, const Data
             size_t i = 0;
             for (; i < tuple_size; ++i)
             {
-                bool is_conversion_ok = convertFieldToTypeStrict(tuple[i], *types[i], tuple_values[i]);
-                if (!is_conversion_ok)
+                auto converted_field = convertFieldToTypeStrict(tuple[i], *types[i]);
+                if (!converted_field)
                     break;
+                tuple_values[i] = std::move(*converted_field);
 
                 bool need_insert_null = transform_null_in && types[i]->isNullable();
                 if (tuple_values[i].isNull() && !need_insert_null)
